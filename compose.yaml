@@ -1,0 +1,99 @@
+# Each system runs under its own profile and uses identical Postgres settings. Only the HTTP ports are
+# published: Formance on 3068, Torment on 8088.
+name: torbench
+
+x-postgres: &postgres
+  image: postgres:17
+  command: ["-c", "max_connections=200", "-c", "shared_buffers=1GB"]
+  environment:
+    POSTGRES_USER: bench
+    POSTGRES_PASSWORD: bench
+    POSTGRES_DB: bench
+  healthcheck:
+    test: ["CMD", "pg_isready", "-U", "bench"]
+    interval: 2s
+    retries: 30
+  shm_size: 1g
+
+x-formance-env: &formance-env
+  POSTGRES_URI: postgresql://bench:bench@formance-postgres/bench?sslmode=disable
+  POSTGRES_MAX_OPEN_CONNS: "40"
+  POSTGRES_MAX_IDLE_CONNS: "40"
+  POSTGRES_CONN_MAX_IDLE_TIME: 5m
+
+services:
+  formance-postgres:
+    <<: *postgres
+    profiles: [formance]
+    volumes: [formance-pg:/var/lib/postgresql/data]
+
+  formance-worker:
+    image: ghcr.io/formancehq/ledger:v2.4.17
+    profiles: [formance]
+    command: worker
+    environment: *formance-env
+    depends_on:
+      formance-postgres: {condition: service_healthy}
+
+  formance:
+    image: ghcr.io/formancehq/ledger:v2.4.17
+    profiles: [formance]
+    command: serve
+    ports: ["3068:3068"]
+    environment:
+      <<: *formance-env
+      AUTO_UPGRADE: "true"
+      EXPERIMENTAL_FEATURES: "true"
+      BULK_PARALLEL: "10"
+      BULK_MAX_SIZE: "10000"
+    depends_on:
+      formance-postgres: {condition: service_healthy}
+
+  torment-postgres:
+    <<: *postgres
+    profiles: [torment]
+    volumes: [torment-pg:/var/lib/postgresql/data]
+
+  tigerbeetle:
+    image: ghcr.io/tigerbeetle/tigerbeetle:0.17.9
+    profiles: [torment]
+    # TB_DEV_FLAG defaults to --development; set it empty on a Linux host with a real NVMe drive.
+    # --development shrinks the request size to 32 KiB (254 transfers), so --limit-request restores
+    # the production 1 MiB (8189 transfers).
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        [ -f /data/0_0.tigerbeetle ] || ./tigerbeetle format --cluster=0 --replica=0 --replica-count=1 ${TB_DEV_FLAG---development} /data/0_0.tigerbeetle
+        exec ./tigerbeetle start --addresses=0.0.0.0:3000 ${TB_DEV_FLAG---development} --experimental --limit-request=1MiB --cache-grid=${TB_CACHE_GRID:-1GiB} /data/0_0.tigerbeetle
+    volumes: [torment-tb:/data]
+    # the TigerBeetle client only accepts IP addresses
+    networks:
+      default:
+        ipv4_address: 172.30.0.10
+    security_opt: [seccomp=unconfined]
+    cap_add: [IPC_LOCK]
+
+  torment:
+    build: ${TORMENT_DIR:-../Torment}
+    profiles: [torment]
+    ports: ["8088:8080"]
+    environment:
+      DATABASE_URL: postgres://bench:bench@torment-postgres/bench?sslmode=disable
+      TB_ADDRESS: 172.30.0.10:3000
+      API_KEYS: bench-key
+    # the TigerBeetle client uses io_uring, which the default seccomp profile blocks
+    security_opt: [seccomp=unconfined]
+    depends_on:
+      torment-postgres: {condition: service_healthy}
+      tigerbeetle: {condition: service_started}
+    restart: on-failure
+
+networks:
+  default:
+    ipam:
+      config: [{subnet: 172.30.0.0/24}]
+
+volumes:
+  formance-pg:
+  torment-pg:
+  torment-tb:
